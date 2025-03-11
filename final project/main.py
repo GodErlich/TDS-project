@@ -132,13 +132,6 @@ def prepare_data_for_rule_mining(data):
         [str(item) for item in transaction if pd.notnull(item) and str(item) != "nan"]
         for transaction in transactions
     ]
-
-    # Debug: print a sample of the mapping
-    print("\nSample of value to column mapping:")
-    sample_items = list(value_to_column.items())[:20]  # First 20 items
-    for value, column in sample_items:
-        print(f"  {value} -> {column}")
-
     return transactions, value_to_column
 
 
@@ -401,7 +394,7 @@ def simple_error_rule_mining(dataset_name):
 
         # 4. Mine error patterns with association rules
         print("\n4. Mining error patterns with association rules...")
-        min_support = 0.1
+        min_support = 0.3
         frequent_itemsets, rules, value_to_column = mine_association_rules(
             error_transactions,
             min_support=min_support,
