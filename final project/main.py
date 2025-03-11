@@ -14,11 +14,797 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
-
 import warnings
-import pandas as pd
-import numpy as np
-from sklearn.datasets import load_breast_cancer
+
+warnings.filterwarnings("ignore")
+
+
+def prepare_data_for_rule_mining(data):
+    """
+    Prepare data for association rule mining by discretizing numerical features
+    and formatting categorical features appropriately.
+
+    Creates a value_to_column mapping to track which column each value came from,
+    with improved handling of numeric values to avoid ambiguity.
+
+    Args:
+        data (DataFrame): Data to prepare
+
+    Returns:
+        tuple: (list of transactions, value_to_column_mapping)
+    """
+    prepared_data = data.copy()
+
+    # Create a mapping dictionary to track which column each value belongs to
+    value_to_column = {}
+
+    # Process columns in a deterministic order to ensure consistent mapping
+    sorted_columns = sorted(prepared_data.columns)
+
+    # First pass: Process all categorical columns
+    for col in sorted_columns:
+        if (
+            prepared_data[col].dtype == "object"
+            or prepared_data[col].dtype.name == "category"
+        ):
+            # Get unique values
+            unique_values = prepared_data[col].dropna().unique()
+
+            # Add mappings for both formats (with and without column prefix)
+            for val in unique_values:
+                item_name = f"{col}_{val}"
+                # Store with column prefix
+                value_to_column[item_name] = col
+
+                # Only store raw value if it's not a simple number
+                # This avoids ambiguity with bin numbers
+                if not str(val).isdigit() and not isinstance(val, (int, float)):
+                    value_to_column[str(val)] = col
+
+            # Apply transformation
+            prepared_data[col] = prepared_data[col].apply(
+                lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
+            )
+
+    # Second pass: Process all numerical columns
+    for col in sorted_columns:
+        if (
+            prepared_data[col].dtype in ["int64", "float64"]
+            and col in prepared_data.columns
+        ):
+            # Skip columns with too few unique values or all same value
+            if prepared_data[col].nunique() <= 1 or prepared_data[col].std() == 0:
+                # For single-value columns, use a special format
+                unique_values = prepared_data[col].unique()
+                for val in unique_values:
+                    item_name = f"{col}_{val}"
+                    value_to_column[item_name] = col
+                    # DO NOT add the raw value mapping to avoid ambiguity
+
+                prepared_data[col] = prepared_data[col].apply(lambda x: f"{col}_{x}")
+                continue
+
+            try:
+                # Discretize using quantiles - store the bin mapping
+                binned_values = pd.qcut(
+                    prepared_data[col], q=4, labels=False, duplicates="drop"
+                )
+
+                # Create a special format for binned values to avoid ambiguity
+                for bin_label in sorted(binned_values.dropna().unique()):
+                    bin_name = f"{col}_{bin_label}"
+                    # Only store with column prefix format
+                    value_to_column[bin_name] = col
+
+                    # Special format for numeric bins to avoid ambiguity
+                    numeric_bin_name = f"{col}_bin_{bin_label}"
+                    value_to_column[numeric_bin_name] = col
+
+                # Apply transformation with special format
+                prepared_data[col] = binned_values.apply(
+                    lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
+                )
+
+            except ValueError:
+                # Fall back to equal-width bins if qcut fails
+                binned_values = pd.cut(
+                    prepared_data[col], bins=4, labels=False, duplicates="drop"
+                )
+
+                # Create a special format for binned values to avoid ambiguity
+                for bin_label in sorted(binned_values.dropna().unique()):
+                    bin_name = f"{col}_{bin_label}"
+                    # Only store with column prefix format
+                    value_to_column[bin_name] = col
+
+                    # Special format for numeric bins to avoid ambiguity
+                    numeric_bin_name = f"{col}_bin_{bin_label}"
+                    value_to_column[numeric_bin_name] = col
+
+                # Apply transformation
+                prepared_data[col] = binned_values.apply(
+                    lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
+                )
+
+    # Convert to transactions
+    transactions = prepared_data.values.tolist()
+    transactions = [
+        [str(item) for item in transaction if pd.notnull(item) and str(item) != "nan"]
+        for transaction in transactions
+    ]
+
+    # Debug: print a sample of the mapping
+    print("\nSample of value to column mapping:")
+    sample_items = list(value_to_column.items())[:20]  # First 20 items
+    for value, column in sample_items:
+        print(f"  {value} -> {column}")
+
+    return transactions, value_to_column
+
+
+def mine_association_rules(
+    transactions,
+    min_support=0.3,
+    min_confidence=0.5,
+    min_lift=1.0,
+    value_to_column=None,
+):
+    """
+    Mine association rules from transaction data.
+
+    Now accepts and returns the value_to_column mapping.
+
+    Args:
+        transactions (list): List of transactions
+        min_support (float): Minimum support threshold
+        min_confidence (float): Minimum confidence threshold
+        min_lift (float): Minimum lift threshold
+        value_to_column (dict): Mapping from values to their original columns
+
+    Returns:
+        tuple: (frequent_itemsets DataFrame, rules DataFrame, value_to_column mapping)
+    """
+    # Convert transactions to a one-hot encoded DataFrame
+    te = TransactionEncoder()
+    te_ary = te.fit_transform(transactions)
+    df = pd.DataFrame(te_ary, columns=te.columns_)
+
+    # Update the value_to_column dictionary with any new unmapped items
+    if value_to_column is not None:
+        # Extract all unique items from the transactions
+        all_items = set()
+        for transaction in transactions:
+            all_items.update(transaction)
+
+        # Check for unmapped items and try to infer their column
+        for item in all_items:
+            if item not in value_to_column and "_" in item:
+                # Try to infer column from the prefix
+                parts = item.split("_", 1)
+                if len(parts) == 2:
+                    col, val = parts
+                    value_to_column[item] = col
+
+    # Find frequent itemsets
+    frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
+
+    # Generate association rules
+    if len(frequent_itemsets) > 0:
+        rules = association_rules(
+            frequent_itemsets, metric="confidence", min_threshold=min_confidence
+        )
+
+        # Filter rules by lift
+        rules = rules[rules["lift"] >= min_lift]
+        return frequent_itemsets, rules, value_to_column
+    else:
+        # If no frequent itemsets found, return empty DataFrames
+        return pd.DataFrame(), pd.DataFrame(), value_to_column
+
+
+def prepare_rules_for_application(rules, value_to_column=None):
+    """
+    Convert association rules from mlxtend to our dictionary format.
+    Now uses value_to_column mapping to resolve columns for both antecedent and consequent items.
+
+    Args:
+        rules: DataFrame of association rules from mlxtend
+        value_to_column: Dictionary mapping values to their original columns
+
+    Returns:
+        List: List of dictionaries where each dictionary represents a rule
+              with feature-value pairs extracted from both antecedents and consequents
+    """
+    rule_dicts = []
+
+    for index, rule in rules.iterrows():
+        rule_dict = {}
+
+        # The antecedents and consequents in mlxtend format are stored as frozensets
+        antecedents = rule["antecedents"]
+        consequents = rule["consequents"]
+
+        print(
+            f"Processing rule {index}, antecedents: {antecedents}, consequents: {consequents}"
+        )
+
+        # Helper function to process items (for both antecedents and consequents)
+        def process_item(item, result_dict):
+            # First option: Check if the item contains an equals sign (our custom format)
+            if "=" in item:
+                feature, value = item.split("=", 1)
+                # Try to convert numeric values
+                try:
+                    if value.isdigit():
+                        value = int(value)
+                    elif "." in value and all(
+                        part.isdigit() for part in value.split(".", 1)
+                    ):
+                        value = float(value)
+                except (ValueError, AttributeError):
+                    pass  # Keep as string if conversion fails
+                result_dict[feature] = value
+
+            # Second option: Check if the item has column_value format
+            elif "_" in item:
+                parts = item.split("_", 1)
+                if len(parts) == 2:
+                    feature, value = parts
+                    # Try to convert numeric values
+                    try:
+                        if value.isdigit():
+                            value = int(value)
+                        elif "." in value and all(
+                            part.isdigit() for part in value.split(".", 1)
+                        ):
+                            value = float(value)
+                    except (ValueError, AttributeError):
+                        pass  # Keep as string if conversion fails
+                    result_dict[feature] = value
+
+            # Third option: Use the value_to_column mapping to find the column
+            elif value_to_column is not None and item in value_to_column:
+                feature = value_to_column[item]
+                value = item  # Keep the original value
+
+                # If the value contains the column name as a prefix, strip it
+                if value.startswith(feature + "_"):
+                    value = value[len(feature) + 1 :]
+
+                # Try to convert numeric values
+                try:
+                    if value.isdigit():
+                        value = int(value)
+                    elif "." in value and all(
+                        part.isdigit() for part in value.split(".", 1)
+                    ):
+                        value = float(value)
+                except (ValueError, AttributeError):
+                    pass  # Keep as string if conversion fails
+
+                result_dict[feature] = value
+
+            else:
+                # For simple values without a column hint, we need help from value_to_column
+                if value_to_column is not None and str(item) in value_to_column:
+                    feature = value_to_column[str(item)]
+                    result_dict[feature] = item
+                else:
+                    # Last resort: Use the item itself as both feature and value
+                    print(f"Warning: Could not determine column for item '{item}'")
+                    result_dict[item] = 1
+
+        # Create a temporary consequent dictionary to track consequent features separately
+        consequent_dict = {}
+
+        # Process each item in the antecedent
+        for item in antecedents:
+            process_item(item, rule_dict)
+
+        # Process each item in the consequent
+        for item in consequents:
+            process_item(item, consequent_dict)
+
+        # Add consequent features to main rule dictionary
+        # This puts consequents at the same level as antecedents
+        rule_dict.update(consequent_dict)
+
+        # Include metadata from the rule
+        rule_dict["confidence"] = rule["confidence"]
+        rule_dict["lift"] = rule["lift"]
+        rule_dict["support"] = rule["support"]
+
+        # Include the original rule patterns for reference
+        rule_dict["original_antecedents"] = list(antecedents)
+        rule_dict["original_consequents"] = list(consequents)
+
+        # Mark the consequent fields for reference if needed
+        rule_dict["consequent_fields"] = list(consequent_dict.keys())
+
+        rule_dicts.append(rule_dict)
+
+    # Print sample rules
+    if rule_dicts:
+        print("\nSample rules in new format:")
+        for i, rule in enumerate(rule_dicts[: min(3, len(rule_dicts))]):
+            # Format a more readable representation of the rule
+            # Get antecedent and consequent fields
+            antecedent_fields = [
+                k
+                for k in rule.keys()
+                if k
+                not in [
+                    "confidence",
+                    "lift",
+                    "support",
+                    "original_antecedents",
+                    "original_consequents",
+                    "consequent_fields",
+                ]
+                + rule.get("consequent_fields", [])
+            ]
+
+            consequent_fields = rule.get("consequent_fields", [])
+
+            # Create formatted strings
+            antecedent_str = ", ".join([f"{k}={rule[k]}" for k in antecedent_fields])
+            consequent_str = ", ".join([f"{k}={rule[k]}" for k in consequent_fields])
+
+            print(
+                f"Rule {i+1}: IF {antecedent_str} THEN {consequent_str} "
+                + f"(conf={rule['confidence']:.2f}, lift={rule['lift']:.2f})"
+            )
+
+    return rule_dicts
+
+
+def simple_error_rule_mining(dataset_name):
+    """
+    Simple implementation of the error rule mining approach.
+    Now with improved column mapping.
+
+    Args:
+        dataset_name: Name of the dataset to use
+
+    Returns:
+        dict: Results of the experiment
+    """
+    print(f"\n{'='*50}")
+    print(f"DATASET: {dataset_name.upper()}")
+    print(f"{'='*50}")
+
+    try:
+        # 1. Load and preprocess data
+        print("\n1. Loading and preprocessing data...")
+        dtf = read_data(dataset_name)
+        main_feature = feature_by_dataset(dataset_name)
+        print(
+            f"Dataset loaded with {len(dtf)} samples and {len(dtf.columns)} features."
+        )
+        print(f"Target feature: {main_feature}")
+
+        # 2. Train initial model
+        print("\n2. Training initial model...")
+        X_train, X_test, y_train, y_test, model = process_data(dtf, dataset_name)
+        print(
+            f"Data split into {len(X_train)} training and {len(X_test)} test samples."
+        )
+
+        # 3. Detect and analyze errors
+        print("\n3. Detecting and analyzing errors...")
+        errors_df, error_transactions, value_to_column = detect_errors(
+            X_train, y_train, model, dataset=dataset_name
+        )
+        error_count = errors_df["error"].sum()
+        error_rate = error_count / len(errors_df) * 100
+        print(f"Found {error_count} errors in training data ({error_rate:.2f}%).")
+
+        # 4. Mine error patterns with association rules
+        print("\n4. Mining error patterns with association rules...")
+        # Start with a fairly low support for more rules
+        min_support = 0.3
+        frequent_itemsets, rules, value_to_column = mine_association_rules(
+            error_transactions,
+            min_support=min_support,
+            min_confidence=0.4,
+            min_lift=1.0,
+            value_to_column=value_to_column,
+        )
+
+        # If we didn't find rules, try with even lower support
+        if rules.empty:
+            print(
+                f"No rules found with support={min_support}. Trying with lower support..."
+            )
+            min_support = 0.2
+            frequent_itemsets, rules, value_to_column = mine_association_rules(
+                error_transactions,
+                min_support=min_support,
+                min_confidence=0.3,
+                min_lift=1.0,
+                value_to_column=value_to_column,
+            )
+
+        if not rules.empty:
+            print(f"Found {len(rules)} rules with min_support={min_support}")
+
+            # Sort rules by lift and confidence
+            sorted_rules = rules.sort_values(by=["confidence", "lift"], ascending=False)
+
+            top_n = 10
+            top_5_rules = sorted_rules.head(top_n)
+
+            # Convert to our clearer dictionary format with column mapping
+            rule_dicts = prepare_rules_for_application(top_5_rules, value_to_column)
+
+            # 5. Display top rules
+            print(f"\n5. Top {top_n} error patterns discovered:")
+            for i, rule in enumerate(rule_dicts):
+                # Get confidence and lift
+                confidence = rule["confidence"]
+                lift = rule["lift"]
+
+                # Get antecedent and consequent fields
+                consequent_fields = rule.get("consequent_fields", [])
+                antecedent_fields = [
+                    k
+                    for k in rule.keys()
+                    if k
+                    not in [
+                        "confidence",
+                        "lift",
+                        "support",
+                        "original_antecedents",
+                        "original_consequents",
+                        "consequent_fields",
+                    ]
+                    + consequent_fields
+                ]
+
+                # For display only
+                if antecedent_fields:
+                    condition_str = ", ".join(
+                        [f"{feat}={rule[feat]}" for feat in antecedent_fields]
+                    )
+                    if consequent_fields:
+                        consequent_str = ", ".join(
+                            [f"{feat}={rule[feat]}" for feat in consequent_fields]
+                        )
+                        print(
+                            f"Rule {i+1}: IF {condition_str} THEN {consequent_str} (conf={confidence:.2f}, lift={lift:.2f})"
+                        )
+                    else:
+                        print(
+                            f"Rule {i+1}: IF {condition_str} THEN Error (conf={confidence:.2f}, lift={lift:.2f})"
+                        )
+                else:
+                    # If we couldn't parse into feature-value pairs, show original
+                    original_ant = rule.get("original_antecedents", [])
+                    condition_str = ", ".join([str(item) for item in original_ant])
+
+                    if consequent_fields:
+                        consequent_str = ", ".join(
+                            [f"{feat}={rule[feat]}" for feat in consequent_fields]
+                        )
+                        print(
+                            f"Rule {i+1}: IF {condition_str} THEN {consequent_str} (conf={confidence:.2f}, lift={lift:.2f})"
+                        )
+                    else:
+                        print(
+                            f"Rule {i+1}: IF {condition_str} THEN Error (conf={confidence:.2f}, lift={lift:.2f})"
+                        )
+
+            # 6. Get original model predictions on test data
+            y_pred_orig = model.predict(X_test)
+            orig_accuracy = accuracy_score(y_test, y_pred_orig)
+            orig_f1 = f1_score(y_test, y_pred_orig, average="weighted")
+
+            print(f"\n6. Original model performance:")
+            print(f"Accuracy: {orig_accuracy:.4f}")
+            print(f"F1 score: {orig_f1:.4f}")
+
+            # 7. Apply rules to flip predictions on test data
+            print("\n7. Applying top 5 rules to test data...")
+            y_pred_corrected = predict_with_rules(model, X_test, rule_dicts)
+
+            # 8. Evaluate corrected predictions
+            corrected_accuracy = accuracy_score(y_test, y_pred_corrected)
+            corrected_f1 = f1_score(y_test, y_pred_corrected, average="weighted")
+
+            print("\n8. Performance after applying error correction rules:")
+            print(
+                f"Accuracy: {corrected_accuracy:.4f} ({(corrected_accuracy-orig_accuracy)*100:+.2f}%)"
+            )
+            print(f"F1 score: {corrected_f1:.4f} ({(corrected_f1-orig_f1)*100:+.2f}%)")
+
+            # 9. Count errors fixed vs introduced
+            errors_fixed = sum((y_pred_orig != y_test) & (y_pred_corrected == y_test))
+            errors_introduced = sum(
+                (y_pred_orig == y_test) & (y_pred_corrected != y_test)
+            )
+            print(f"\n9. Error analysis:")
+            print(f"Errors fixed: {errors_fixed}")
+            print(f"Errors introduced: {errors_introduced}")
+            print(f"Net improvement: {errors_fixed - errors_introduced} samples")
+
+            return {
+                "dataset": dataset_name,
+                "original_accuracy": orig_accuracy,
+                "corrected_accuracy": corrected_accuracy,
+                "original_f1": orig_f1,
+                "corrected_f1": corrected_f1,
+                "errors_fixed": errors_fixed,
+                "errors_introduced": errors_introduced,
+                "top_rules": rule_dicts,
+            }
+
+        else:
+            print("No association rules found after multiple attempts.")
+            return {"dataset": dataset_name, "status": "No rules found"}
+
+    except Exception as e:
+        import traceback
+
+        print(f"Error processing {dataset_name} dataset: {e}")
+        print(traceback.format_exc())
+        return {"dataset": dataset_name, "status": f"Error: {str(e)}"}
+
+
+def detect_errors(X, y, model, threshold=0.2, dataset="marketing"):
+    """
+    Detect errors in model predictions and prepare them for association rule mining.
+    For regression, errors are predictions with relative error above threshold.
+    For classification, errors are misclassifications.
+    Now returns value_to_column mapping.
+
+    Args:
+        X (DataFrame): Feature data
+        y (Series): True labels
+        model (Pipeline): Trained model pipeline
+        threshold (float): Relative error threshold for regression
+        dataset (str): Dataset name to determine if classification or regression
+
+    Returns:
+        tuple: (DataFrame with error column, Error data for rule mining, value_to_column mapping)
+    """
+    # Make predictions
+    y_pred = model.predict(X)
+
+    # Determine if this is a classification or regression task
+    # For classification, errors are simply misclassifications
+    errors = y_pred != y
+
+    # Create a dataframe with error flag
+    data_with_errors = X.copy()
+    data_with_errors["error"] = errors.astype(int)
+
+    # Filter to only error cases
+    error_data = data_with_errors[data_with_errors["error"] == 1].drop("error", axis=1)
+
+    # Prepare error data for association rule mining
+    error_transactions, value_to_column = prepare_data_for_rule_mining(error_data)
+
+    return data_with_errors, error_transactions, value_to_column
+
+
+def check_if_row_matches_rule(row, rule_items):
+    """
+    Check if a single data row matches all items in a rule.
+    Designed to handle rules where items are just values without column information.
+
+    Args:
+        row: A pandas Series representing a single data row
+        rule_items: List of items (values) from a rule
+
+    Returns:
+        bool: True if the row matches all rule items, False otherwise
+    """
+    for item in rule_items:
+        item_matched = False
+
+        # First, try direct value matching (check if the item appears in any column)
+        for col, value in row.items():
+            # Convert both to strings for comparison to handle numeric vs string types
+            if str(value).lower() == str(item).lower():
+                print(
+                    f"Match found: '{item}' appears in column '{col}' with value '{value}'"
+                )
+                item_matched = True
+                break
+
+        # Handle special cases for compound items with underscores
+        if not item_matched and "_" in item:
+            parts = item.split("_")
+
+            # Case 1: Item could be "column_value" format
+            if len(parts) == 2:
+                col_name, expected_value = parts
+                if (
+                    col_name in row.index
+                    and str(row[col_name]).lower() == str(expected_value).lower()
+                ):
+                    print(
+                        f"Match found: Column '{col_name}' has expected value '{expected_value}'"
+                    )
+                    item_matched = True
+
+            # Case 2: Item could be a value with underscores (like "United-States")
+            # Try to match it against any column
+            if not item_matched:
+                for col, value in row.items():
+                    if str(value).lower() == item.lower():
+                        print(f"Match found: '{item}' appears in column '{col}'")
+                        item_matched = True
+                        break
+
+        # If we still haven't found a match, check if the item appears as part of any column value
+        if not item_matched:
+            for col, value in row.items():
+                if isinstance(value, str) and item.lower() in value.lower():
+                    print(
+                        f"Partial match found: '{item}' is contained in column '{col}' with value '{value}'"
+                    )
+                    item_matched = True
+                    break
+
+        if not item_matched:
+            print(f"No match found for rule item: '{item}'")
+
+            # For debugging, print some row values
+            print(f"Row values sample: {dict(list(row.items())[:5])}")
+            return False
+
+    # If we get here, all items matched
+    print(f"SUCCESS: Row matched all rule items!")
+    return True
+
+
+def predict_with_rules(model, X, rules):
+    """
+    Apply the model first, then flip predictions for rows matching rules.
+    Rules are applied in order of their index (highest lift/confidence first).
+    Each row is only flipped once by the highest-priority matching rule.
+
+    Args:
+        model: Trained model
+        X: Input features DataFrame
+        rules: List of rule dictionaries with feature-value pairs
+
+    Returns:
+        y_pred: Corrected predictions
+    """
+    # Get original predictions
+    y_pred = model.predict(X)
+
+    # Convert to DataFrame if not already
+    X_df = X.copy()
+
+    # Keep track of matches
+    matches_count = 0
+    rules_matched = {i: 0 for i in range(len(rules))}
+
+    # Track which rows have already been flipped
+    flipped_rows = set()
+
+    # For each row, check if it matches any rule
+    for row_idx, (i, row) in enumerate(X_df.iterrows()):
+        # Skip if this row has already been flipped
+        if row_idx in flipped_rows:
+            continue
+
+        # Check each rule in order (rules should already be sorted by lift/confidence)
+        for rule_idx, rule in enumerate(rules):
+            # Skip metadata fields when matching
+            rule_conditions = {
+                k: v
+                for k, v in rule.items()
+                if k
+                not in [
+                    "confidence",
+                    "lift",
+                    "support",
+                    "original_antecedents",
+                    "original_consequents",
+                    "consequent_fields",
+                ]
+            }
+
+            # Standard feature-value matching
+            matches_rule = True
+            for feature, expected_value in rule_conditions.items():
+                if feature not in row:
+                    matches_rule = False
+                    break
+
+                # Handle different types properly
+                actual_value = row[feature]
+
+                # Convert types for comparison if needed
+                if isinstance(expected_value, (int, float)) and isinstance(
+                    actual_value, str
+                ):
+                    try:
+                        actual_value = (
+                            float(actual_value)
+                            if "." in actual_value
+                            else int(actual_value)
+                        )
+                    except ValueError:
+                        pass
+                elif isinstance(expected_value, str) and isinstance(
+                    actual_value, (int, float)
+                ):
+                    expected_value = (
+                        float(expected_value)
+                        if "." in expected_value
+                        else int(expected_value)
+                    )
+
+                # Compare values
+                if actual_value != expected_value:
+                    matches_rule = False
+                    break
+
+            # If row matches the rule, flip the prediction
+            if matches_rule:
+                old_pred = y_pred[row_idx]
+                y_pred[row_idx] = 1 - y_pred[row_idx]
+                matches_count += 1
+                rules_matched[rule_idx] += 1
+                flipped_rows.add(row_idx)  # Mark this row as flipped
+
+                if i < 10:  # Show more matches for debugging
+                    print(
+                        f"MATCH! Rule {rule_idx+1} flipped prediction for row {row_idx} from {old_pred} to {y_pred[row_idx]}"
+                    )
+
+                # Break out of rules loop, but continue with next row
+                break
+
+    # Print summary of matches
+    print(f"\nTotal rows where rules were applied: {matches_count} out of {len(X_df)}")
+    for rule_idx, count in rules_matched.items():
+        if count > 0:
+            print(f"Rule {rule_idx+1} matched and flipped {count} predictions")
+
+    return y_pred
+
+
+def main():
+    """
+    Run the error rule mining approach on multiple datasets.
+    """
+    datasets = ["adult"]  # Add more datasets as needed
+    all_results = {}
+
+    for dataset in datasets:
+        results = simple_error_rule_mining(dataset)
+        all_results[dataset] = results
+
+    # Print summary of results
+    print("\n\n" + "=" * 50)
+    print("SUMMARY OF RESULTS")
+    print("=" * 50)
+
+    for dataset, result in all_results.items():
+        print(f"\n{dataset.upper()}")
+        if "status" in result:
+            print(f"Status: {result['status']}")
+        else:
+            print(
+                f"Accuracy: {result['original_accuracy']:.4f} -> {result['corrected_accuracy']:.4f} ({(result['corrected_accuracy']-result['original_accuracy'])*100:+.2f}%)"
+            )
+            print(
+                f"F1 Score: {result['original_f1']:.4f} -> {result['corrected_f1']:.4f} ({(result['corrected_f1']-result['original_f1'])*100:+.2f}%)"
+            )
+            print(
+                f"Errors fixed: {result['errors_fixed']}, Errors introduced: {result['errors_introduced']}"
+            )
+            print(
+                f"Net improvement: {result['errors_fixed'] - result['errors_introduced']} samples"
+            )
+
+    return all_results
 
 
 def read_breast_cancer_data():
@@ -134,9 +920,6 @@ def read_spam_email_data():
     return df
 
 
-warnings.filterwarnings("ignore")
-
-
 def read_adult_data():
     url = "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data"
     column_names = [
@@ -178,48 +961,6 @@ def read_data(dataset: str):
         return read_spam_email_data()
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
-
-
-def predict_with_rule_corrections(pipeline, X, rules=None, correction_map=None):
-    """
-    Make predictions and apply manual corrections based on rule matches.
-    Handles both string and integer rule IDs consistently.
-
-    Args:
-        pipeline: Trained model pipeline
-        X: Input features
-        rules: Association rules DataFrame
-
-    Returns:
-        y_pred: Corrected predictions
-        rule_matches: DataFrame showing which rules matched each sample
-    """
-    final_predictions = None
-    rule_matches = None
-
-    return final_predictions, rule_matches
-
-
-def get_rule_matches(pipeline, X, rules):
-    """
-    Helper function to just get the rule matches without applying corrections.
-    Useful for analysis and debugging.
-    """
-    # Create rule features
-    if hasattr(pipeline, "named_steps") and "preprocessor" in pipeline.named_steps:
-        preprocessor = pipeline.named_steps["preprocessor"]
-        X_preprocessed = preprocessor.transform(X)
-    else:
-        X_preprocessed = X
-
-    rule_generator = ErrorRuleFeatureGenerator(rules)
-    rule_generator.fit(X_preprocessed)
-    rule_matches = rule_generator.transform(X_preprocessed)
-
-    # Add mapping information for reference
-    rule_id_map = {v: k for k, v in rule_generator.rule_column_map.items()}
-
-    return rule_matches, rule_id_map
 
 
 def feature_by_dataset(dataset):
@@ -395,437 +1136,5 @@ def process_data(dtf, dataset, use_error_rules=False, rules=None):
     return X_train, X_test, y_train, y_test, pipeline
 
 
-def detect_errors(X, y, model, threshold=0.2, dataset="marketing"):
-    """
-    Detect errors in model predictions and prepare them for association rule mining.
-    For regression, errors are predictions with relative error above threshold.
-    For classification, errors are misclassifications.
-
-    Args:
-        X (DataFrame): Feature data
-        y (Series): True labels
-        model (Pipeline): Trained model pipeline
-        threshold (float): Relative error threshold for regression
-        dataset (str): Dataset name to determine if classification or regression
-
-    Returns:
-        DataFrame: Original data with error column
-        DataFrame: Error data in a format suitable for rule mining
-    """
-    # Make predictions
-    y_pred = model.predict(X)
-
-    # Determine if this is a classification or regression task
-    # For classification, errors are simply misclassifications
-    errors = y_pred != y
-
-    # Create a dataframe with error flag
-    data_with_errors = X.copy()
-    data_with_errors["error"] = errors.astype(int)
-
-    # Filter to only error cases
-    error_data = data_with_errors[data_with_errors["error"] == 1].drop("error", axis=1)
-
-    # Prepare error data for association rule mining
-    error_data_prepared = prepare_data_for_rule_mining(error_data)
-
-    return data_with_errors, error_data_prepared
-
-
-def prepare_data_for_rule_mining(data):
-    """
-    Prepare data for association rule mining by discretizing numerical features
-    and formatting categorical features appropriately.
-
-    Args:
-        data (DataFrame): Data to prepare
-
-    Returns:
-        list: List of transactions for association rule mining
-    """
-    prepared_data = data.copy()
-
-    # Discretize numerical columns using quantiles
-    for col in prepared_data.select_dtypes(include=["int64", "float64"]).columns:
-        # Skip columns with too few unique values or all same value
-        if prepared_data[col].nunique() <= 1 or prepared_data[col].std() == 0:
-            prepared_data[col] = prepared_data[col].apply(lambda x: f"{col}_{x}")
-            continue
-
-        try:
-            prepared_data[col] = pd.qcut(
-                prepared_data[col], q=4, labels=False, duplicates="drop"
-            )
-            prepared_data[col] = prepared_data[col].apply(
-                lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
-            )
-        except ValueError:
-            # Fall back to equal-width bins if qcut fails
-            prepared_data[col] = pd.cut(
-                prepared_data[col], bins=4, labels=False, duplicates="drop"
-            )
-            prepared_data[col] = prepared_data[col].apply(
-                lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
-            )
-
-    # Format categorical columns
-    for col in prepared_data.select_dtypes(include=["object"]).columns:
-        prepared_data[col] = prepared_data[col].apply(
-            lambda x: f"{col}_{x}" if pd.notnull(x) else np.nan
-        )
-
-    # Convert to transactions
-    transactions = prepared_data.values.tolist()
-    transactions = [
-        [str(item) for item in transaction if pd.notnull(item) and str(item) != "nan"]
-        for transaction in transactions
-    ]
-
-    return transactions
-
-
-def mine_association_rules(
-    transactions, min_support=0.3, min_confidence=0.5, min_lift=1.0
-):
-    """
-    Mine association rules from transaction data.
-
-    Args:
-        transactions (list): List of transactions
-        min_support (float): Minimum support threshold
-        min_confidence (float): Minimum confidence threshold
-        min_lift (float): Minimum lift threshold
-
-    Returns:
-        DataFrame: Frequent itemsets
-        DataFrame: Association rules
-    """
-    # Convert transactions to a one-hot encoded DataFrame
-    te = TransactionEncoder()
-    te_ary = te.fit_transform(transactions)
-    df = pd.DataFrame(te_ary, columns=te.columns_)
-
-    # Find frequent itemsets
-    frequent_itemsets = apriori(df, min_support=min_support, use_colnames=True)
-
-    # Generate association rules
-    if len(frequent_itemsets) > 0:
-        rules = association_rules(
-            frequent_itemsets, metric="confidence", min_threshold=min_confidence
-        )
-
-        # Filter rules by lift
-        rules = rules[rules["lift"] >= min_lift]
-        return frequent_itemsets, rules
-    else:
-        # If no frequent itemsets found, return empty DataFrames
-        return pd.DataFrame(), pd.DataFrame()
-
-
-def apply_rules_to_improve_model(X_train, X_test, y_train, y_test, rules, dataset):
-    """
-    Apply discovered error patterns to improve the model using various strategies
-    """
-    print("\n=== Improved Model Performance ===")
-
-    # Strategy 1: Use error rules as features
-    original_X = pd.concat([X_train, X_test], axis=0)
-    original_y = pd.concat([y_train, y_test], axis=0)
-
-    # Create a DataFrame with features and target
-    combined_df = pd.concat([original_X, original_y], axis=1)
-
-    try:
-        _, _, _, _, improved_model = process_data(
-            combined_df,
-            dataset,
-            use_error_rules=True,
-            rules=rules,
-        )
-        return improved_model
-    except ValueError as e:
-        print(f"Warning: Error when applying rules to improve model: {e}")
-        print("Falling back to standard model without error rules...")
-
-        return None
-
-
-def apply_rules_to_predictions(X, y_pred, rules, correction_map=None):
-    """
-    Apply association rules to modify model predictions for matching data rows.
-
-    Args:
-        X: Input features (pandas DataFrame)
-        y_pred: Original model predictions (numpy array or pandas Series)
-        rules: DataFrame of association rules from Apriori algorithm with columns:
-               - antecedents: list of feature conditions that form the rule
-               - consequents: list of target conditions
-               - rule_id: unique identifier for each rule
-        correction_map: Dictionary mapping rule IDs to new prediction values
-                       {rule_id: new_prediction_value}
-
-    Returns:
-        corrected_predictions: Model predictions after applying rule corrections
-        rule_matches: DataFrame showing which rules matched each sample
-    """
-
-    # If no correction map provided, create a default one
-    if correction_map is None:
-        correction_map = {}
-        # Default: flip the prediction (0->1, 1->0)
-        for rule_id in rules["rule_id"].unique():
-            # Get the consequent (error class) for this rule
-            if "consequent_values" in rules.columns:
-                error_class = rules.loc[
-                    rules["rule_id"] == rule_id, "consequent_values"
-                ].iloc[0]
-                # Set the correction to the opposite of the error class
-                correction_map[rule_id] = 1 if error_class == 0 else 0
-            else:
-                # If consequent values not provided, default to flipping the prediction
-                correction_map[rule_id] = None  # Will be determined during correction
-
-    # Create a DataFrame to track rule matches
-    rule_matches = pd.DataFrame(index=X.index)
-
-    # Create a copy of the predictions to modify
-    corrected_predictions = y_pred.copy()
-
-    # Apply each rule
-    for _, rule in rules.iterrows():
-        rule_id = rule["rule_id"]
-        # Get the features and values that define this rule (antecedents)
-        antecedents = rule["antecedents"]
-
-        # Initialize mask for this rule (all True)
-        rule_mask = pd.Series(True, index=X.index)
-
-        # Apply each condition in the antecedent
-        for feature, value in antecedents:
-            if feature in X.columns:
-                # Check if the feature exists and matches the value
-                if isinstance(value, (list, tuple)):
-                    # For categorical features with multiple possible values
-                    rule_mask &= X[feature].isin(value)
-                else:
-                    # For numeric or binary features
-                    rule_mask &= X[feature] == value
-            else:
-                print(
-                    f"Warning: Feature '{feature}' from rule {rule_id} not found in data"
-                )
-
-        # Store which rows match this rule
-        rule_column = f"rule_{rule_id}"
-        rule_matches[rule_column] = rule_mask.astype(int)
-
-        # Apply correction if specified
-        if rule_id in correction_map:
-            matches = rule_mask
-            if any(matches):
-                correction = correction_map[rule_id]
-                # If correction is None, flip the prediction
-                if correction is None:
-                    corrected_predictions[matches] = 1 - corrected_predictions[matches]
-                else:
-                    corrected_predictions[matches] = correction
-                print(
-                    f"Applied correction for rule {rule_id} to {matches.sum()} samples"
-                )
-
-    return corrected_predictions, rule_matches
-
-
-class ErrorRuleApplier:
-    """
-    A class to apply error correction rules to model predictions
-    """
-
-    def __init__(self, rules, correction_map=None):
-        """
-        Initialize the rule applier with a set of rules
-
-        Args:
-            rules: DataFrame of association rules
-            correction_map: Dictionary mapping rule IDs to corrected predictions
-        """
-        self.rules = rules
-        self.correction_map = correction_map
-
-    def fit(self, X, y_true, y_pred):
-        """
-        Analyze the model errors and create a correction map if not provided
-
-        Args:
-            X: Feature DataFrame
-            y_true: True labels
-            y_pred: Model predictions
-        """
-        if self.correction_map is None:
-            self.correction_map = {}
-            errors = y_true != y_pred
-
-            # For each rule, determine the best correction
-            for rule_id in self.rules["rule_id"].unique():
-                rule_column = f"rule_{rule_id}"
-
-                # Apply the rule to find matches
-                _, rule_matches = apply_rules_to_predictions(
-                    X, y_pred, self.rules[self.rules["rule_id"] == rule_id], None
-                )
-
-                if rule_column in rule_matches.columns:
-                    # Find samples where the rule matches
-                    matches = rule_matches[rule_column] == 1
-                    if any(matches):
-                        # Find errors within the matches
-                        match_errors = errors[matches]
-
-                        # If the rule is associated with errors, determine the correction
-                        if match_errors.sum() > 0:
-                            # Count errors by predicted class
-                            error_0 = (
-                                (y_pred[matches] == 0) & (y_true[matches] == 1)
-                            ).sum()
-                            error_1 = (
-                                (y_pred[matches] == 1) & (y_true[matches] == 0)
-                            ).sum()
-
-                            # Choose correction based on most common error type
-                            if error_0 > error_1:
-                                # More errors where model predicted 0 but should be 1
-                                self.correction_map[rule_id] = 1
-                            elif error_1 > error_0:
-                                # More errors where model predicted 1 but should be 0
-                                self.correction_map[rule_id] = 0
-
-        return self
-
-    def transform(self, X, y_pred):
-        """
-        Apply rules to correct predictions
-
-        Args:
-            X: Feature DataFrame
-            y_pred: Model predictions
-
-        Returns:
-            corrected_predictions: Predictions after applying rules
-            rule_matches: DataFrame showing which rules matched
-        """
-        return apply_rules_to_predictions(X, y_pred, self.rules, self.correction_map)
-
-
-def evaluate_with_rule_corrections(pipeline, X, y_true, rules, correction_map=None):
-    """
-    Evaluate model with manual rule-based corrections.
-
-    Args:
-        pipeline: Trained model pipeline
-        X: Test features
-        y_true: True target values
-        rules: Association rules DataFrame
-        correction_map: Dictionary mapping rule IDs to corrected predictions
-
-    Returns:
-        metrics: Dictionary of evaluation metrics
-        rule_matches: DataFrame showing which rules matched each sample
-    """
-    # Make predictions with corrections
-    y_pred, rule_matches = predict_with_rule_corrections(
-        pipeline, X, rules, correction_map
-    )
-
-    # Add true values and original predictions for comparison
-    rule_matches["true_value"] = y_true
-    rule_matches["original_prediction"] = pipeline.predict(X)
-    rule_matches["corrected_prediction"] = y_pred
-
-    # Calculate evaluation metrics
-    metrics = {}
-
-    metrics["accuracy"] = accuracy_score(y_true, y_pred)
-    metrics["f1_score"] = f1_score(y_true, y_pred, average="weighted")
-
-    # For binary classification, calculate ROC AUC
-    if len(np.unique(y_true)) == 2:
-        try:
-            proba_method = getattr(pipeline, "predict_proba", None)
-            if callable(proba_method):
-                y_pred_proba = pipeline.predict_proba(X)[:, 1]
-                metrics["roc_auc"] = roc_auc_score(y_true, y_pred_proba)
-        except:
-            pass
-
-    return metrics, rule_matches
-
-
-# Example of how to use these functions in your main code:
-def main_with_rule_corrections():
-    datasets = ["adult", "heart", "fraud", "email"]
-
-    for dataset in datasets:
-        print(f"\n=== Running for {dataset} dataset with rule corrections ===")
-
-        try:
-            # Load and preprocess data
-            print("=== Loading and preprocessing data ===")
-            dtf = read_data(dataset)
-
-            # Train initial model
-            print("\n=== Training initial model ===")
-            X_train, X_test, y_train, y_test, model = process_data(dtf, dataset)
-
-            # Detect and analyze errors
-            print("\n=== Detecting and analyzing errors ===")
-            errors, error_data = detect_errors(X_test, y_test, model, dataset=dataset)
-            print(
-                f"Number of errors detected: {errors['error'].sum()} out of {len(errors)} samples"
-            )
-
-            # Mine error patterns
-            print("\n=== Mining error patterns ===")
-            frequent_itemsets, rules = mine_association_rules(
-                error_data, min_support=0.3, min_confidence=0.5, min_lift=1.2
-            )
-
-            if not rules.empty:
-                # Sort rules by lift for better insights
-                top_n = 10
-                sorted_rules = rules.sort_values(
-                    by=["confidence", "lift"], ascending=False
-                ).head(top_n)
-
-                # Evaluate the model without corrections
-                print("\n=== Original Model Performance ===")
-                orig_metrics, _ = evaluate_with_rule_corrections(
-                    model,
-                    X_test,
-                    y_test,
-                    rules=sorted_rules,
-                )
-                for metric, value in orig_metrics.items():
-                    print(f"{metric}: {value:.3f}")
-
-                for i, (idx, rule) in enumerate(sorted_rules.head(3).iterrows()):
-                    # In a real scenario, you would analyze each rule and decide the appropriate correction
-                    # For demonstration, we're flipping 0 to 1 and 1 to 0
-                    print(
-                        f"Rule {idx}: {rule['antecedents']} -> {rule['consequents']} (lift: {rule['lift']:.2f})"
-                    )
-
-            else:
-                print("No association rules found.")
-
-        except Exception as e:
-            import traceback
-
-            print(f"Error processing {dataset} dataset: {e}")
-            print(traceback.format_exc())
-
-
 if __name__ == "__main__":
-    main_with_rule_corrections()
-    # another idea, to find rules to correct the model we would also compare the prediction.
-    # we will check the predictions that the rule made. if most of the predictions are 0 we w
-    # ill only fix rule + preditiction 0.
+    main()
