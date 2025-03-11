@@ -401,8 +401,7 @@ def simple_error_rule_mining(dataset_name):
 
         # 4. Mine error patterns with association rules
         print("\n4. Mining error patterns with association rules...")
-        # Start with a fairly low support for more rules
-        min_support = 0.3
+        min_support = 0.1
         frequent_itemsets, rules, value_to_column = mine_association_rules(
             error_transactions,
             min_support=min_support,
@@ -411,31 +410,17 @@ def simple_error_rule_mining(dataset_name):
             value_to_column=value_to_column,
         )
 
-        # If we didn't find rules, try with even lower support
-        if rules.empty:
-            print(
-                f"No rules found with support={min_support}. Trying with lower support..."
-            )
-            min_support = 0.2
-            frequent_itemsets, rules, value_to_column = mine_association_rules(
-                error_transactions,
-                min_support=min_support,
-                min_confidence=0.3,
-                min_lift=1.0,
-                value_to_column=value_to_column,
-            )
-
         if not rules.empty:
             print(f"Found {len(rules)} rules with min_support={min_support}")
 
             # Sort rules by lift and confidence
-            sorted_rules = rules.sort_values(by=["confidence", "lift"], ascending=False)
+            sorted_rules = rules.sort_values(by=["lift", "confidence"], ascending=False)
 
             top_n = 10
-            top_5_rules = sorted_rules.head(top_n)
+            top_rules = sorted_rules.head(top_n)
 
             # Convert to our clearer dictionary format with column mapping
-            rule_dicts = prepare_rules_for_application(top_5_rules, value_to_column)
+            rule_dicts = prepare_rules_for_application(top_rules, value_to_column)
 
             # 5. Display top rules
             print(f"\n5. Top {top_n} error patterns discovered:")
@@ -774,7 +759,7 @@ def main():
     """
     Run the error rule mining approach on multiple datasets.
     """
-    datasets = ["adult"]  # Add more datasets as needed
+    datasets = ["heart", "adult"]  # Add more datasets as needed
     all_results = {}
 
     for dataset in datasets:
