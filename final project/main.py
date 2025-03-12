@@ -13,9 +13,6 @@ from sklearn.metrics import (
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-import io
-import requests
-from zipfile import ZipFile
 import traceback
 import warnings
 
