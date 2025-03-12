@@ -601,7 +601,7 @@ def error_rule_mining(dataset_name):
 
             # Sort rules by lift and minus confidence
             sorted_rules = rules.sort_values(
-                by=["lift", "confidence"], ascending=[False]
+                by=["lift", "confidence"], ascending=[False, False]
             )
 
             top_n = 5
